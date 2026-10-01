@@ -1,0 +1,17 @@
+# Dependencias de Node
+node_modules/
+
+# Archivos de entorno y claves
+.env
+*.env
+
+# Datos locales generados en ejecución
+conversaciones/
+chroma_db/
+*.log
+
+# Archivos del sistema operativo y editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
