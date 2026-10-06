@@ -8,10 +8,13 @@ node_modules/
 # Datos locales generados en ejecución
 conversaciones/
 chroma_db/
+volt_database.sqlite
 *.log
+*.dbS
 
 # Archivos del sistema operativo y editores
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+all/

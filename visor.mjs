@@ -1,22 +1,28 @@
 import http from "http";
 import fs from "fs";
 import path from "path";
+import Database from "better-sqlite3";
 import { ChromaClient } from "chromadb";
 
+// --- BASE DE DATOS SQLITE Y CHROMADB ---
+const db = new Database("volt_database.sqlite");
 const chroma = new ChromaClient({ host: "localhost", port: 8000, ssl: false });
 
-// Asegurar que existan las carpetas locales
+// Crear tabla de personalidades en SQLite
+db.exec(`
+  CREATE TABLE IF NOT EXISTS personalidades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nombre TEXT UNIQUE NOT NULL,
+    prompt TEXT NOT NULL
+  );
+`);
+
 const carpetaConversaciones = path.join(process.cwd(), "conversaciones");
-if (!fs.existsSync(carpetaConversaciones)) {
-  fs.mkdirSync(carpetaConversaciones, { recursive: true });
-}
+if (!fs.existsSync(carpetaConversaciones)) fs.mkdirSync(carpetaConversaciones, { recursive: true });
 
-const carpetaPersonalidades = path.join(process.cwd(), "personalidades");
-if (!fs.existsSync(carpetaPersonalidades)) {
-  fs.mkdirSync(carpetaPersonalidades, { recursive: true });
-}
+const carpetaEmociones = path.join(process.cwd(), "emociones");
+if (!fs.existsSync(carpetaEmociones)) fs.mkdirSync(carpetaEmociones, { recursive: true });
 
-// Función para buscar información actualizada en la web usando DuckDuckGo
 async function buscarEnWeb(query) {
   try {
     const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
@@ -26,7 +32,6 @@ async function buscarEnWeb(query) {
       }
     });
     const html = await res.text();
-    
     const snippets = [];
     const regex = /<a class="result__snippet[^>]*>([\s\S]*?)<\/a>/g;
     let match;
@@ -34,10 +39,8 @@ async function buscarEnWeb(query) {
       const textoLimpio = match[1].replace(/<[^>]+>/g, '').trim();
       if (textoLimpio) snippets.push(textoLimpio);
     }
-
     return snippets.length > 0 ? snippets.join("\n- ") : null;
   } catch (e) {
-    console.log("Error al consultar la web:", e.message);
     return null;
   }
 }
@@ -58,43 +61,30 @@ async function obtenerEmbedding(texto) {
 
 async function preguntarAQwen(prompt, historial, contextoMemoria, contextoWeb, sistemaPrompt) {
   const fechaActual = new Date().toLocaleDateString('es-ES', {
-    weekday: 'long',
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric'
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
   });
 
   let promptEstructurado = `${sistemaPrompt || 'Eres Volt, un asistente IA amigable, inteligente y conversacional.'}\n\n`;
+  promptEstructurado += `CONTEXTO TEMPORAL DEL SISTEMA:\nHoy es ${fechaActual}.\n\n`;
+  promptEstructurado += `REGLAS DE MEMORIA Y EMOCIÓN:
+1. Evalúa el tono y contexto de tu respuesta y selecciona UNA emoción base: ["normal", "pensando", "feliz", "entusiasmado", "sorprendido", "confundido", "triste", "serio"].
+2. Detecta si hay datos personales permanentes para extraer en "nuevoRecuerdo", de lo contrario usa null.
 
-  promptEstructurado += `CONTEXTO TEMPORAL DEL SISTEMA:
-Hoy es ${fechaActual}.\n\n`;
+FORMATO DE RESPUESTA REQUERIDO (JSON válido):
+{
+  "respuesta": "Tu respuesta conversacional en markdown",
+  "nuevoRecuerdo": "Frase resumida del dato a recordar" o null,
+  "emocion": "normal" | "pensando" | "feliz" | "entusiasmado" | "sorprendido" | "confundido" | "triste" | "serio"
+}\n\n`;
 
-  promptEstructurado += `REGLAS DE INTERACCIÓN:
-1. NO saludes ("Hola", "¡Hola Kris!", etc.) a menos que el usuario te esté saludando directamente en este mensaje.
-2. NO es necesario preguntar todo el tiempo si puedes ayudar o si el usuario quiere hacer algo, solo hazlo la primera vez y de forma natural.
-3. Si conoces el nombre del usuario (Kris), úsalo solo muy de vez en cuando y de forma natural.
-4. Si recibes [INFORMACIÓN ACTUALIZADA DE LA WEB], basa tu respuesta principal en esos datos reales y recientes.
-5. Consulta el [HISTORIAL RECIENTE DE LA CONVERSACIÓN] para mantener el hilo de temas hablados previamente en esta sesión.
-6. Responde de forma clara, con viñetas y formato estructurado.\n\n`;
-
-  if (contextoMemoria) {
-    promptEstructurado += `[RECUERDOS DE MEMORIA PERSONAL]:\n${contextoMemoria}\n\n`;
-  }
-
-  if (contextoWeb) {
-    promptEstructurado += `[INFORMACIÓN ACTUALIZADA DE LA WEB (${fechaActual})]:\n- ${contextoWeb}\n\n`;
-  }
-
+  if (contextoMemoria) promptEstructurado += `[RECUERDOS EXISTENTES]:\n${contextoMemoria}\n\n`;
+  if (contextoWeb) promptEstructurado += `[WEB (${fechaActual})]:\n- ${contextoWeb}\n\n`;
   if (historial && historial.length > 0) {
-    promptEstructurado += `[HISTORIAL RECIENTE DE LA CONVERSACIÓN]:\n`;
-    historial.forEach(m => {
-      const rol = m.rol === 'user' ? 'USUARIO' : 'VOLT';
-      promptEstructurado += `${rol}: ${m.texto}\n`;
-    });
+    promptEstructurado += `[HISTORIAL RECIENTE]:\n`;
+    historial.slice(-4).forEach(m => promptEstructurado += `${m.rol === 'user' ? 'USUARIO' : 'VOLT'}: ${m.texto}\n`);
     promptEstructurado += `\n`;
   }
-
-  promptEstructurado += `[USUARIO]: ${prompt}\n[VOLT]:`;
+  promptEstructurado += `[USUARIO]: ${prompt}\n[RESPUESTA EN JSON]:`;
 
   const res = await fetch("http://localhost:11434/api/generate", {
     method: "POST",
@@ -103,20 +93,56 @@ Hoy es ${fechaActual}.\n\n`;
       model: "qwen2.5:14b",
       prompt: promptEstructurado,
       stream: false,
-      options: {
-        num_predict: 1024,
-        temperature: 0.7
-      }
+      format: "json",
+      options: { num_ctx: 1024, num_predict: 1024, temperature: 0.5 }
     })
   });
   const data = await res.json();
-  return data.response;
+  try {
+    return JSON.parse(data.response);
+  } catch(e) {
+    return { respuesta: data.response, nuevoRecuerdo: null, emocion: "normal" };
+  }
 }
 
 const server = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
 
-  // Endpoint para guardar chat
+  if (req.method === "GET" && req.url === "/styles.css") {
+    try {
+      const rutaCss = path.join(process.cwd(), "styles.css");
+      const css = fs.readFileSync(rutaCss, "utf-8");
+      res.writeHead(200, { "Content-Type": "text/css; charset=utf-8" });
+      res.end(css);
+    } catch (e) {
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("styles.css no encontrado");
+    }
+    return;
+  }
+
+  if (req.method === "GET" && req.url.startsWith("/emociones/")) {
+    try {
+      const nombreImg = path.basename(req.url);
+      const rutaImg = path.join(carpetaEmociones, nombreImg);
+      if (fs.existsSync(rutaImg)) {
+        res.writeHead(200, { "Content-Type": "image/png" });
+        res.end(fs.readFileSync(rutaImg));
+        return;
+      }
+    } catch (e) {}
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Imagen no encontrada");
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/apagar") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, mensaje: "Apagando..." }));
+    setTimeout(() => process.exit(0), 500);
+    return;
+  }
+
   if (req.method === "POST" && req.url === "/api/guardar-chat") {
     let body = "";
     req.on("data", chunk => { body += chunk; });
@@ -125,33 +151,7 @@ const server = http.createServer(async (req, res) => {
         const { nombreArchivo, chat } = JSON.parse(body);
         let nombreLimpio = nombreArchivo.trim().replace(/[^a-z0-9_\-\s]/gi, '_');
         if (!nombreLimpio.endsWith('.json')) nombreLimpio += '.json';
-
-        const rutaFinal = path.join(carpetaConversaciones, nombreLimpio);
-        fs.writeFileSync(rutaFinal, JSON.stringify(chat, null, 2), "utf-8");
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, ruta: rutaFinal }));
-      } catch (err) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: err.message }));
-      }
-    });
-    return;
-  }
-
-  // Endpoint para guardar una personalidad
-  if (req.method === "POST" && req.url === "/api/guardar-personalidad") {
-    let body = "";
-    req.on("data", chunk => { body += chunk; });
-    req.on("end", () => {
-      try {
-        const { nombre, prompt } = JSON.parse(body);
-        let nombreLimpio = nombre.trim().replace(/[^a-z0-9_\-\s]/gi, '_');
-        if (!nombreLimpio.endsWith('.json')) nombreLimpio += '.json';
-
-        const rutaFinal = path.join(carpetaPersonalidades, nombreLimpio);
-        fs.writeFileSync(rutaFinal, JSON.stringify({ nombre, prompt }, null, 2), "utf-8");
-
+        fs.writeFileSync(path.join(carpetaConversaciones, nombreLimpio), JSON.stringify(chat, null, 2), "utf-8");
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {
@@ -162,15 +162,29 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Endpoint para listar y obtener las personalidades guardadas
+  // API SQLITE: Guardar/Actualizar Personalidad
+  if (req.method === "POST" && req.url === "/api/guardar-personalidad") {
+    let body = "";
+    req.on("data", chunk => { body += chunk; });
+    req.on("end", () => {
+      try {
+        const { nombre, prompt } = JSON.parse(body);
+        const stmt = db.prepare("INSERT INTO personalidades (nombre, prompt) VALUES (?, ?) ON CONFLICT(nombre) DO UPDATE SET prompt=excluded.prompt");
+        stmt.run(nombre, prompt);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // API SQLITE: Listar personalidades
   if (req.method === "GET" && req.url === "/api/personalidades") {
     try {
-      const archivos = fs.readdirSync(carpetaPersonalidades).filter(f => f.endsWith('.json'));
-      const personalidades = archivos.map(archivo => {
-        const contenido = fs.readFileSync(path.join(carpetaPersonalidades, archivo), 'utf-8');
-        return { archivo, ...JSON.parse(contenido) };
-      });
-
+      const personalidades = db.prepare("SELECT * FROM personalidades ORDER BY nombre ASC").all();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true, personalidades }));
     } catch (err) {
@@ -180,146 +194,82 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Endpoint para enviar el chat a la IA
   if (req.method === "POST" && req.url === "/api/chat") {
     let body = "";
     req.on("data", chunk => { body += chunk; });
     req.on("end", async () => {
       try {
         const { mensaje, historial, systemPrompt } = JSON.parse(body);
-
         let contextoMemoria = null;
         let contextoWeb = null;
 
-        const saludos = ["hola", "buenas", "que tal", "qué tal", "buenos dias", "buenas noches"];
-        const esSaludo = saludos.some(s => mensaje.toLowerCase().trim().startsWith(s)) && mensaje.length < 15;
-
-        const palabrasClaveWeb = ["noticia", "noticias", "actualidad", "hoy", "reciente", "evento", "ultim hora", "última hora", "lanzamiento", "ganador", "resultado", "quien gano", "quién ganó"];
-        const requiereWeb = palabrasClaveWeb.some(p => mensaje.toLowerCase().includes(p));
+        const esSaludo = ["hola", "buenas", "que tal"].some(s => mensaje.toLowerCase().trim().startsWith(s)) && mensaje.length < 15;
+        const requiereWeb = ["noticia", "noticias", "actualidad", "hoy", "reciente", "evento", "Tiempo"].some(p => mensaje.toLowerCase().includes(p));
 
         if (!esSaludo) {
-          if (requiereWeb) {
-            console.log("🔍 Buscando en la web:", mensaje);
-            contextoWeb = await buscarEnWeb(mensaje);
-          }
+          const [resWeb, vectorPregunta] = await Promise.all([
+            requiereWeb ? buscarEnWeb(mensaje) : Promise.resolve(null),
+            obtenerEmbedding(mensaje)
+          ]);
 
-          const vectorPregunta = await obtenerEmbedding(mensaje);
+          contextoWeb = resWeb;
+
           if (vectorPregunta) {
             try {
               const coleccion = await chroma.getOrCreateCollection({ name: "recuerdos_volt", embeddingFunction: null });
-              const resultado = await coleccion.query({
-                queryEmbeddings: [vectorPregunta],
-                nResults: 1
-              });
-
-              if (resultado.documents[0]?.[0] && resultado.distances && resultado.distances[0]?.[0] < 1.3) {
+              const resultado = await coleccion.query({ queryEmbeddings: [vectorPregunta], nResults: 1 });
+              if (resultado.documents[0]?.[0] && resultado.distances?.[0]?.[0] < 1.3) {
                 contextoMemoria = resultado.documents[0][0];
               }
-            } catch (e) {
-              console.log("Aviso: No se pudo consultar la memoria.");
-            }
+            } catch (e) {}
           }
         }
 
-        const respuestaIA = await preguntarAQwen(mensaje, historial, contextoMemoria, contextoWeb, systemPrompt);
+        const resultadoIA = await preguntarAQwen(mensaje, historial, contextoMemoria, contextoWeb, systemPrompt);
+        let recuerdoGuardado = null;
+
+        if (resultadoIA.nuevoRecuerdo) {
+          try {
+            const vectorNuevoRecuerdo = await obtenerEmbedding(resultadoIA.nuevoRecuerdo);
+            if (vectorNuevoRecuerdo) {
+              const coleccion = await chroma.getOrCreateCollection({ name: "recuerdos_volt", embeddingFunction: null });
+              await coleccion.add({
+                ids: ["memoria_" + Date.now()],
+                embeddings: [vectorNuevoRecuerdo],
+                documents: [resultadoIA.nuevoRecuerdo]
+              });
+              recuerdoGuardado = resultadoIA.nuevoRecuerdo;
+            }
+          } catch(errMem) {}
+        }
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ 
-          respuesta: respuestaIA, 
+          respuesta: resultadoIA.respuesta, 
           recuerdoUsado: contextoMemoria,
-          webUsada: contextoWeb ? true : false 
+          nuevoRecuerdoGuardado: recuerdoGuardado,
+          webUsada: contextoWeb ? true : false,
+          emocion: resultadoIA.emocion || "normal"
         }));
       } catch (err) {
         res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ respuesta: "Error al procesar la solicitud: " + err.message }));
+        res.end(JSON.stringify({ respuesta: "Error: " + err.message, emocion: "triste" }));
       }
     });
     return;
   }
 
-  // Interfaz HTML
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.end(`
     <!DOCTYPE html>
     <html lang="es">
     <head>
       <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>Asistente Local con Memoria y Web</title>
       <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+      <link rel="stylesheet" href="/styles.css">
       <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-      <style>
-        :root {
-          --color-accent: #dc2626;
-          --color-bg-dark: #09090b;
-          --color-panel: #121215;
-          --color-card: #1c1c21;
-          --color-border: #2e2e38;
-        }
-
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
-        body { background-color: var(--color-bg-dark); color: #f4f4f5; height: 100vh; display: flex; overflow: hidden; }
-        
-        .sidebar { width: 320px; background: var(--color-panel); border-right: 1px solid var(--color-border); padding: 1.25rem; display: flex; flex-direction: column; gap: 1rem; overflow-y: auto; }
-        .logo { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 1.1rem; color: #f4f4f5; }
-        .logo i { color: var(--color-accent); font-size: 1.4rem; transition: color 0.3s; }
-        
-        .card { background: var(--color-card); border: 1px solid var(--color-border); border-radius: 8px; padding: 1rem; }
-        .card-title { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; color: #a1a1aa; letter-spacing: 0.05em; margin-bottom: 0.75rem; display: flex; justify-content: space-between; align-items: center; }
-        
-        label { font-size: 0.8rem; color: #d4d4d8; display: block; margin-bottom: 0.4rem; }
-        input[type="text"], select, textarea { width: 100%; background: var(--color-panel); border: 1px solid var(--color-border); border-radius: 6px; padding: 0.6rem; color: #f4f4f5; font-size: 0.85rem; outline: none; margin-bottom: 0.75rem; }
-        textarea { height: 75px; resize: none; font-size: 0.8rem; line-height: 1.4; }
-        
-        .color-picker-box { display: flex; align-items: center; justify-content: space-between; background: var(--color-panel); border: 1px solid var(--color-border); padding: 0.5rem 0.75rem; border-radius: 6px; }
-        .color-picker-box span { font-size: 0.8rem; color: #d4d4d8; font-weight: 500; }
-        input[type="color"] { -webkit-appearance: none; border: none; width: 32px; height: 32px; border-radius: 50%; cursor: pointer; background: transparent; }
-        input[type="color"]::-webkit-color-swatch-wrapper { padding: 0; }
-        input[type="color"]::-webkit-color-swatch { border: 1px solid var(--color-border); border-radius: 50%; }
-
-        .btn-action { background: var(--color-accent); border: none; color: white; width: 100%; padding: 0.6rem; border-radius: 6px; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 0.85rem; margin-bottom: 0.5rem; transition: 0.2s; }
-        .btn-action:hover { filter: brightness(1.15); }
-        .btn-secondary { background: var(--color-card); color: #f4f4f5; border: 1px solid var(--color-border); }
-        .btn-secondary:hover { background: #27272a; }
-        .btn-danger { background: rgba(220, 38, 38, 0.15); border: 1px solid rgba(220, 38, 38, 0.4); color: #f87171; }
-        .btn-danger:hover { background: rgba(220, 38, 38, 0.25); }
-
-        .chat-list { display: flex; flex-direction: column; gap: 6px; max-height: 140px; overflow-y: auto; margin-top: 5px; }
-        .chat-item { background: var(--color-panel); padding: 8px 10px; border-radius: 6px; font-size: 0.8rem; color: #a1a1aa; cursor: pointer; display: flex; justify-content: space-between; align-items: center; border: 1px solid transparent; }
-        .chat-item:hover { border-color: var(--color-accent); color: white; }
-        .chat-item.active { background: #27272a; border-color: var(--color-accent); color: white; font-weight: 600; }
-        .chat-item-del { color: #ef4444; cursor: pointer; padding: 2px 5px; }
-
-        .main-content { flex: 1; display: flex; flex-direction: column; background: var(--color-bg-dark); }
-        .header { height: 50px; border-bottom: 1px solid var(--color-border); padding: 0 1.5rem; display: flex; align-items: center; justify-content: space-between; background: var(--color-panel); }
-        .tag { background: #27272a; color: var(--color-accent); padding: 4px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; border: 1px solid var(--color-border); }
-        .badge-secure { color: #f87171; font-size: 0.75rem; display: flex; align-items: center; gap: 6px; }
-
-        .chat-area { flex: 1; overflow-y: auto; padding: 2rem; display: flex; flex-direction: column; gap: 1.5rem; align-items: center; }
-        
-        .welcome-box { border: 1px solid var(--color-border); background: var(--color-panel); border-radius: 12px; padding: 2.5rem; text-align: center; max-width: 650px; margin-top: auto; margin-bottom: auto; }
-        .welcome-box i { font-size: 2.2rem; color: var(--color-accent); margin-bottom: 1rem; transition: color 0.3s; }
-        .welcome-box h2 { font-size: 1.3rem; margin-bottom: 0.5rem; color: #f4f4f5; }
-        .welcome-box p { color: #a1a1aa; font-size: 0.875rem; line-height: 1.5; }
-
-        .message-row { width: 100%; max-width: 800px; display: flex; gap: 1rem; }
-        .message-row.user { justify-content: flex-end; }
-        .bubble { max-width: 85%; padding: 0.9rem 1.2rem; border-radius: 10px; font-size: 0.92rem; line-height: 1.6; }
-        .bubble p { margin-bottom: 0.5rem; }
-        .bubble p:last-child { margin-bottom: 0; }
-        .bubble ul, .bubble ol { margin-left: 1.2rem; margin-bottom: 0.5rem; }
-        .user .bubble { background: var(--color-accent); color: white; border-bottom-right-radius: 2px; transition: background 0.3s; }
-        .bot .bubble { background: var(--color-panel); border: 1px solid var(--color-border); color: #f4f4f5; border-bottom-left-radius: 2px; }
-        
-        .info-tag { display: block; margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--color-border); font-size: 0.75rem; font-style: italic; }
-        .memory-info { color: #4ade80; }
-        .web-info { color: #f87171; }
-
-        .input-container { padding: 1.25rem 2rem; background: var(--color-bg-dark); border-top: 1px solid var(--color-border); display: flex; justify-content: center; }
-        .input-box { width: 100%; max-width: 800px; background: var(--color-panel); border: 1px solid var(--color-border); border-radius: 10px; padding: 6px 12px; display: flex; align-items: center; gap: 10px; }
-        .input-box input { border: none; margin: 0; padding: 0.6rem; font-size: 0.9rem; flex: 1; background: transparent; color: white; outline: none; }
-        .btn-send { background: var(--color-accent); color: white; border: none; width: 36px; height: 36px; border-radius: 8px; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: background 0.3s; }
-        .btn-send:hover { filter: brightness(1.15); }
-      </style>
     </head>
     <body>
 
@@ -336,7 +286,7 @@ const server = http.createServer(async (req, res) => {
           <div class="card-title">APARIENCIA</div>
           <div class="color-picker-box">
             <span>Color principal:</span>
-            <input type="color" id="accentColorPicker" value="#dc2626" oninput="cambiarColorTema(this.value)">
+            <input type="color" id="accentColorPicker" value="#7c3aed" oninput="cambiarColorTema(this.value)">
           </div>
         </div>
 
@@ -360,28 +310,38 @@ const server = http.createServer(async (req, res) => {
           </button>
         </div>
 
-        <!-- Tarjeta de Personalidad con Selector y Guardado -->
         <div class="card">
           <div class="card-title">PERSONALIDAD</div>
-          
           <label>Cargar Personalidades:</label>
           <select id="selectPersonalidades" onchange="cargarPersonalidadSeleccionada()">
             <option value="">-- Seleccionar Guardada --</option>
           </select>
 
           <label>Prompt del Sistema:</label>
-          <textarea id="sysPrompt">Eres Volt, un asistente personal conversacional. Hablas directo al grano, sin rodeos, formateando las listas con claridad y respondiendo siempre con la información más actual disponible.</textarea>
+          <textarea id="sysPrompt">Eres Volt, un asistente personal conversacional. Hablas directo al grano, sin rodeos, formateando las listas con claridad. NO utilices emojis de colores (como 😃, 😡). En su lugar, exprésate utilizando únicamente emoticonos de texto tradicionales como ":)", ":D", ">:(", ";)", ":O" o ">_<".</textarea>
           
           <button class="btn-action btn-secondary" onclick="guardarPersonalidad()">
-            <i class="fa-solid fa-bookmark"></i> Guardar en /personalidades
+            <i class="fa-solid fa-bookmark"></i> Guardar en Base de Datos (SQLite)
+          </button>
+        </div>
+
+        <div class="card">
+          <div class="card-title">SISTEMA</div>
+          <button class="btn-action btn-shutdown" onclick="apagarSistema()">
+            <i class="fa-solid fa-power-off"></i> Apagar IA y Servidor
           </button>
         </div>
       </div>
 
+      <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebarMobile()"></div>
+
       <div class="main-content">
         <div class="header">
+          <button class="btn-menu-mobile" onclick="toggleSidebarMobile()" title="Abrir menú">
+            <i class="fa-solid fa-bars"></i>
+          </button>
           <span class="tag">qwen2.5:14b</span>
-          <span class="badge-secure"><i class="fa-solid fa-globe"></i> Búsqueda Web Activa</span>
+          <span class="badge-secure"><i class="fa-solid fa-globe"></i> Búsqueda Web y Memoria Activa</span>
         </div>
 
         <div class="chat-area" id="chatArea"></div>
@@ -394,21 +354,74 @@ const server = http.createServer(async (req, res) => {
         </div>
       </div>
 
+      <button class="toggle-drawer-btn" onclick="togglePersonaje()" title="Ocultar/Mostrar personaje">
+        <i class="fa-solid fa-user"></i>
+      </button>
+
+      <div class="character-drawer" id="characterDrawer">
+        <img id="voltAvatar" class="character-avatar" src="/emociones/normal1.png" onerror="this.src='https://via.placeholder.com/140/1f2937/ffffff?text=Avatar'" alt="Avatar">
+        <div class="size-control">
+          <i class="fa-solid fa-magnifying-glass-minus" style="font-size:0.75rem; color:#9ca3af;"></i>
+          <input type="range" id="sizeSlider" min="80" max="300" value="140" oninput="cambiarTamanoPersonaje(this.value)" title="Ajustar tamaño">
+          <i class="fa-solid fa-magnifying-glass-plus" style="font-size:0.75rem; color:#9ca3af;"></i>
+        </div>
+      </div>
+
       <script>
         let conversaciones = JSON.parse(localStorage.getItem('volt_chats') || '{}');
         let chatActualId = localStorage.getItem('volt_current_chat') || null;
         let listaPersonalidadesGuardadas = [];
 
-        let colorGuardado = localStorage.getItem('volt_accent_color') || '#dc2626';
+        let colorGuardado = localStorage.getItem('volt_accent_color') || '#1a1a1a';
+        let tamanoGuardado = localStorage.getItem('volt_avatar_size') || '140';
+
+        const cantidadVariantes = {
+          pensando: 2, feliz: 3, entusiasmo: 2, triste: 2, normal: 1, sorprendido: 1, confundido: 1, serio: 1
+        };
+
+        function toggleSidebarMobile() {
+          const sidebar = document.querySelector('.sidebar');
+          const overlay = document.getElementById('sidebarOverlay');
+          sidebar.classList.toggle('open');
+          overlay.classList.toggle('active');
+        }
 
         function cambiarColorTema(nuevoColor) {
           document.documentElement.style.setProperty('--color-accent', nuevoColor);
           localStorage.setItem('volt_accent_color', nuevoColor);
         }
 
+        function cambiarTamanoPersonaje(px) {
+          const img = document.getElementById('voltAvatar');
+          if (img) {
+            img.style.width = px + 'px';
+            img.style.height = px + 'px';
+          }
+          localStorage.setItem('volt_avatar_size', px);
+        }
+
+        function togglePersonaje() {
+          document.getElementById('characterDrawer').classList.toggle('closed');
+        }
+
+        function cambiarEmocion(emocionBase) {
+          const img = document.getElementById('voltAvatar');
+          const maxVariantes = cantidadVariantes[emocionBase] || 1;
+          const numAleatorio = Math.floor(Math.random() * maxVariantes) + 1;
+          img.src = '/emociones/' + \`\${emocionBase}\${numAleatorio}.png\`;
+          img.classList.add('bounce');
+          setTimeout(() => img.classList.remove('bounce'), 200);
+        }
+
         async function inicializar() {
-          document.documentElement.style.setProperty('--color-accent', colorGuardado);
+          cambiarColorTema(colorGuardado);
           document.getElementById('accentColorPicker').value = colorGuardado;
+
+          const slider = document.getElementById('sizeSlider');
+          if (slider) {
+            slider.value = tamanoGuardado;
+            cambiarTamanoPersonaje(tamanoGuardado);
+          }
 
           await cargarListaPersonalidades();
 
@@ -427,10 +440,7 @@ const server = http.createServer(async (req, res) => {
 
         function nuevaConversacion() {
           chatActualId = 'chat_' + Date.now();
-          conversaciones[chatActualId] = {
-            titulo: 'Nueva conversación',
-            mensajes: []
-          };
+          conversaciones[chatActualId] = { titulo: 'Nueva conversación', mensajes: [] };
           guardarEnLocalStorage();
           renderizarHistorial();
           cargarChatArea();
@@ -439,9 +449,7 @@ const server = http.createServer(async (req, res) => {
         function renderizarHistorial() {
           const contenedor = document.getElementById('listaChats');
           contenedor.innerHTML = '';
-
-          const ids = Object.keys(conversaciones).reverse();
-          ids.forEach(id => {
+          Object.keys(conversaciones).reverse().forEach(id => {
             const chat = conversaciones[id];
             const div = document.createElement('div');
             div.className = 'chat-item' + (id === chatActualId ? ' active' : '');
@@ -455,10 +463,7 @@ const server = http.createServer(async (req, res) => {
 
             const iconDel = document.createElement('i');
             iconDel.className = 'fa-solid fa-times chat-item-del';
-            iconDel.onclick = (e) => {
-              e.stopPropagation();
-              eliminarChat(id);
-            };
+            iconDel.onclick = (e) => { e.stopPropagation(); eliminarChat(id); };
 
             div.appendChild(spanTitle);
             div.appendChild(iconDel);
@@ -471,6 +476,14 @@ const server = http.createServer(async (req, res) => {
           guardarEnLocalStorage();
           renderizarHistorial();
           cargarChatArea();
+          if (window.innerWidth <= 768) {
+            const sidebar = document.querySelector('.sidebar');
+            const overlay = document.getElementById('sidebarOverlay');
+            if (sidebar.classList.contains('open')) {
+              sidebar.classList.remove('open');
+              overlay.classList.remove('active');
+            }
+          }
         }
 
         function eliminarChat(id) {
@@ -479,9 +492,8 @@ const server = http.createServer(async (req, res) => {
             const ids = Object.keys(conversaciones);
             chatActualId = ids.length > 0 ? ids[ids.length - 1] : null;
           }
-          if (!chatActualId) {
-            nuevaConversacion();
-          } else {
+          if (!chatActualId) nuevaConversacion();
+          else {
             guardarEnLocalStorage();
             renderizarHistorial();
             cargarChatArea();
@@ -495,32 +507,91 @@ const server = http.createServer(async (req, res) => {
           if (mensajes.length === 0) {
             chatArea.innerHTML = \`
               <div class="welcome-box" id="welcomeBox">
-                <i class="fa-solid fa-globe"></i>
-                <h2>Asistente Local con Web y Memoria</h2>
-                <p>Haz preguntas sobre eventos actuales, noticias de hoy o temas personales guardados.</p>
+                <i class="fa-solid fa-brain"></i>
+                <h2>Asistente Local con Web y Memoria Inteligente</h2>
+                <p>Conversa de forma fluida. Guardaré automáticamente tus preferencias relevantes para recordarlas en cualquier chat.</p>
               </div>
             \`;
             return;
           }
 
           chatArea.innerHTML = '';
-          mensajes.forEach(m => {
+          mensajes.forEach((m, index) => {
             let contenido = m.rol === 'bot' ? marked.parse(m.texto) : m.texto;
             let infoHTML = '';
             if (m.recuerdo) infoHTML += \`<span class="info-tag memory-info"><i class="fa-solid fa-brain"></i> Memoria consultada: "\${m.recuerdo}"</span>\`;
+            if (m.nuevoRecuerdo) infoHTML += \`<span class="info-tag memory-save"><i class="fa-solid fa-floppy-disk"></i> Nuevo recuerdo guardado: "\${m.nuevoRecuerdo}"</span>\`;
             if (m.web) infoHTML += \`<span class="info-tag web-info"><i class="fa-solid fa-globe"></i> Información obtenida de la Web en tiempo real</span>\`;
+
+            let botonesAccion = '';
+            if (m.rol === 'user') {
+              botonesAccion = \`
+                <div class="msg-actions">
+                  <i class="fa-solid fa-pen" title="Editar mensaje" onclick="editarMensaje(\${index})"></i>
+                  <i class="fa-solid fa-trash" title="Borrar mensaje" onclick="borrarMensaje(\${index})"></i>
+                </div>
+              \`;
+            }
 
             chatArea.innerHTML += \`
               <div class="message-row \${m.rol}">
                 <div class="bubble">
                   \${contenido}
                   \${infoHTML}
+                  \${botonesAccion}
                 </div>
               </div>
             \`;
           });
-
           chatArea.scrollTop = chatArea.scrollHeight;
+        }
+
+        function borrarMensaje(index) {
+          if (confirm('¿Quieres eliminar este mensaje?')) {
+            const mensajes = conversaciones[chatActualId].mensajes;
+            if (mensajes[index + 1] && mensajes[index + 1].rol === 'bot') mensajes.splice(index, 2);
+            else mensajes.splice(index, 1);
+            guardarEnLocalStorage();
+            cargarChatArea();
+          }
+        }
+
+        async function editarMensaje(index) {
+          const mensajes = conversaciones[chatActualId].mensajes;
+          const textoOriginal = mensajes[index].texto;
+          const nuevoTexto = prompt('Edita tu mensaje:', textoOriginal);
+          if (!nuevoTexto || nuevoTexto.trim() === '' || nuevoTexto === textoOriginal) return;
+
+          mensajes[index].texto = nuevoTexto.trim();
+          if (mensajes[index + 1] && mensajes[index + 1].rol === 'bot') mensajes.splice(index + 1, 1);
+
+          guardarEnLocalStorage();
+          cargarChatArea();
+
+          const sysPrompt = document.getElementById('sysPrompt').value;
+          const tempId = 'temp-' + Date.now();
+          const chatArea = document.getElementById('chatArea');
+          chatArea.innerHTML += \`<div class="message-row bot" id="\${tempId}"><div class="bubble"><i class="fa-solid fa-spinner fa-spin"></i> Regenerando respuesta...</div></div>\`;
+          chatArea.scrollTop = chatArea.scrollHeight;
+
+          cambiarEmocion('pensando');
+          try {
+            const res = await fetch('/api/chat', {
+              method: 'POST',
+              body: JSON.stringify({ mensaje: nuevoTexto.trim(), historial: mensajes.slice(0, index), systemPrompt: sysPrompt })
+            });
+            const data = await res.json();
+            document.getElementById(tempId)?.remove();
+            mensajes.splice(index + 1, 0, {
+              rol: 'bot', texto: data.respuesta, recuerdo: data.recuerdoUsado, nuevoRecuerdo: data.nuevoRecuerdoGuardado, web: data.webUsada
+            });
+            guardarEnLocalStorage();
+            cargarChatArea();
+            cambiarEmocion(data.emocion || 'normal');
+          } catch(e) {
+            document.getElementById(tempId)?.remove();
+            cambiarEmocion('triste');
+          }
         }
 
         function borrarChatActual() {
@@ -549,107 +620,75 @@ const server = http.createServer(async (req, res) => {
             renderizarHistorial();
           }
 
-          const historialPrevio = conversaciones[chatActualId].mensajes.slice(-6);
-
+          const historialPrevio = conversaciones[chatActualId].mensajes.slice(-4);
           conversaciones[chatActualId].mensajes.push({ rol: 'user', texto: txt });
           guardarEnLocalStorage();
 
+          const indexUser = conversaciones[chatActualId].mensajes.length - 1;
           chatArea.innerHTML += \`
             <div class="message-row user">
-              <div class="bubble">\${txt}</div>
+              <div class="bubble">\${txt}
+                <div class="msg-actions">
+                  <i class="fa-solid fa-pen" title="Editar mensaje" onclick="editarMensaje(\${indexUser})"></i>
+                  <i class="fa-solid fa-trash" title="Borrar mensaje" onclick="borrarMensaje(\${indexUser})"></i>
+                </div>
+              </div>
             </div>
           \`;
-
           input.value = '';
           chatArea.scrollTop = chatArea.scrollHeight;
 
           const tempId = 'temp-' + Date.now();
-          chatArea.innerHTML += \`
-            <div class="message-row bot" id="\${tempId}">
-              <div class="bubble"><i class="fa-solid fa-spinner fa-spin"></i> Estoy pensando...</div>
-            </div>
-          \`;
+          chatArea.innerHTML += \`<div class="message-row bot" id="\${tempId}"><div class="bubble"><i class="fa-solid fa-spinner fa-spin"></i> Estoy pensando...</div></div>\`;
           chatArea.scrollTop = chatArea.scrollHeight;
 
+          cambiarEmocion('pensando');
           try {
             const res = await fetch('/api/chat', {
               method: 'POST',
-              body: JSON.stringify({ 
-                mensaje: txt, 
-                historial: historialPrevio, 
-                systemPrompt: sysPrompt 
-              })
+              body: JSON.stringify({ mensaje: txt, historial: historialPrevio, systemPrompt: sysPrompt })
             });
             const data = await res.json();
-
-            document.getElementById(tempId).remove();
+            document.getElementById(tempId)?.remove();
 
             conversaciones[chatActualId].mensajes.push({
-              rol: 'bot',
-              texto: data.respuesta,
-              recuerdo: data.recuerdoUsado,
-              web: data.webUsada
+              rol: 'bot', texto: data.respuesta, recuerdo: data.recuerdoUsado, nuevoRecuerdo: data.nuevoRecuerdoGuardado, web: data.webUsada
             });
             guardarEnLocalStorage();
 
             let infoHTML = '';
             if (data.recuerdoUsado) infoHTML += \`<span class="info-tag memory-info"><i class="fa-solid fa-brain"></i> Memoria consultada: "\${data.recuerdoUsado}"</span>\`;
+            if (data.nuevoRecuerdoGuardado) infoHTML += \`<span class="info-tag memory-save"><i class="fa-solid fa-floppy-disk"></i> Nuevo recuerdo guardado: "\${data.nuevoRecuerdoGuardado}"</span>\`;
             if (data.webUsada) infoHTML += \`<span class="info-tag web-info"><i class="fa-solid fa-globe"></i> Información obtenida de la Web en tiempo real</span>\`;
 
-            const htmlRespuesta = marked.parse(data.respuesta);
-
-            chatArea.innerHTML += \`
-              <div class="message-row bot">
-                <div class="bubble">
-                  \${htmlRespuesta}
-                  \${infoHTML}
-                </div>
-              </div>
-            \`;
+            chatArea.innerHTML += \`<div class="message-row bot"><div class="bubble">\${marked.parse(data.respuesta)}\${infoHTML}</div></div>\`;
+            cambiarEmocion(data.emocion || 'normal');
           } catch(e) {
-            document.getElementById(tempId).remove();
-            chatArea.innerHTML += \`
-              <div class="message-row bot">
-                <div class="bubble" style="color:#f87171;">Error al procesar la respuesta.</div>
-              </div>
-            \`;
+            document.getElementById(tempId)?.remove();
+            cambiarEmocion('triste');
           }
-
           chatArea.scrollTop = chatArea.scrollHeight;
         }
 
         async function exportarChatJSON() {
           const chat = conversaciones[chatActualId];
-          const nombreSugerido = chat.titulo.replace(/[^a-z0-9_\-\s]/gi, '_');
-
-          const nuevoNombre = prompt('Introduce el nombre con el que deseas guardar esta conversación:', nombreSugerido);
+          const nuevoNombre = prompt('Introduce el nombre con el que deseas guardar esta conversación:', chat.titulo.replace(/[^a-z0-9_\-\s]/gi, '_'));
           if (!nuevoNombre) return;
 
           try {
             const res = await fetch('/api/guardar-chat', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                nombreArchivo: nuevoNombre,
-                chat: chat
-              })
+              body: JSON.stringify({ nombreArchivo: nuevoNombre, chat: chat })
             });
-
             const data = await res.json();
-            if (data.ok) {
-              alert('Conversación guardada con éxito en la carpeta /conversaciones');
-            } else {
-              alert('Error al guardar: ' + data.error);
-            }
-          } catch (e) {
-            alert('Error al intentar guardar el archivo JSON en el servidor.');
-          }
+            if (data.ok) alert('Conversación guardada con éxito.');
+          } catch (e) { alert('Error al guardar.'); }
         }
 
         function importarChatJSON(e) {
           const file = e.target.files[0];
           if (!file) return;
-
           const reader = new FileReader();
           reader.onload = function(evt) {
             try {
@@ -661,89 +700,76 @@ const server = http.createServer(async (req, res) => {
                 guardarEnLocalStorage();
                 renderizarHistorial();
                 cargarChatArea();
-                alert('Conversación importada con éxito.');
-              } else {
-                alert('El archivo JSON no tiene un formato de conversación válido.');
               }
-            } catch(err) {
-              alert('Error al leer el archivo JSON.');
-            }
+            } catch(err) {}
           };
           reader.readAsText(file);
         }
 
-        // --- Funciones de Gestión de Personalidades ---
+        async function guardarPersonalidad() {
+          const promptTxt = document.getElementById('sysPrompt').value.trim();
+          if (!promptTxt) return alert('Prompt vacío.');
+          const nombre = prompt('Nombre de personalidad:');
+          if (!nombre) return;
 
-        // --- Funciones de Gestión de Personalidades Corregidas ---
+          try {
+            const res = await fetch('/api/guardar-personalidad', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ nombre, prompt: promptTxt })
+            });
+            const data = await res.json();
+            if (data.ok) await cargarListaPersonalidades();
+          } catch (e) {}
+        }
 
-async function guardarPersonalidad() {
-  const promptTxt = document.getElementById('sysPrompt').value.trim();
-  if (!promptTxt) return alert('El prompt de personalidad está vacío.');
+        async function cargarListaPersonalidades() {
+          try {
+            const res = await fetch('/api/personalidades');
+            const data = await res.json();
+            if (data.ok) {
+              listaPersonalidadesGuardadas = data.personalidades;
+              const select = document.getElementById('selectPersonalidades');
+              select.innerHTML = '<option value="">-- Seleccionar Guardada --</option>';
+              listaPersonalidadesGuardadas.forEach((p, idx) => {
+                const opt = document.createElement('option');
+                opt.value = idx.toString();
+                opt.innerText = p.nombre;
+                select.appendChild(opt);
+              });
+            }
+          } catch (e) {}
+        }
 
-  const nombre = prompt('Escribe el nombre para esta personalidad (ej. Programador, Traductor, Casual):');
-  if (!nombre) return;
+        function cargarPersonalidadSeleccionada() {
+          const idx = document.getElementById('selectPersonalidades').value;
+          if (idx !== "" && listaPersonalidadesGuardadas[idx]) {
+            document.getElementById('sysPrompt').value = listaPersonalidadesGuardadas[idx].prompt;
+          }
+        }
 
-  try {
-    const res = await fetch('/api/guardar-personalidad', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ nombre, prompt: promptTxt })
-    });
+        async function apagarSistema() {
+          if (confirm('¿Seguro que deseas apagar el servidor?')) {
+            try { await fetch('/api/apagar', { method: 'POST' }); } catch (e) {}
+            window.close();
+            document.body.innerHTML = '<div style="color: white; text-align: center; margin-top: 20%;">Servidor apagado correctamente.</div>';
+          }
+        }
 
-    const data = await res.json();
-    if (data.ok) {
-      alert('Personalidad guardada con éxito en la carpeta /personalidades');
-      // Volver a cargar la lista de personalidades desde el servidor
-      await cargarListaPersonalidades();
-    } else {
-      alert('Error al guardar: ' + data.error);
-    }
-  } catch (e) {
-    alert('Error al guardar la personalidad.');
-  }
-}
-  async function cargarListaPersonalidades() {
-  try {
-    const res = await fetch('/api/personalidades');
-    const data = await res.json();
-    
-    if (data.ok) {
-      listaPersonalidadesGuardadas = data.personalidades;
-      const select = document.getElementById('selectPersonalidades');
-      
-      // Vaciar las opciones actuales
-      select.innerHTML = '';
-
-      // Crear la opción por defecto
-      const optDefault = document.createElement('option');
-      optDefault.value = "";
-      optDefault.innerText = "-- Seleccionar Guardada --";
-      select.appendChild(optDefault);
-      
-      // Agregar cada personalidad guardada como nueva opción
-      listaPersonalidadesGuardadas.forEach((p, idx) => {
-        const opt = document.createElement('option');
-        opt.value = idx.toString();
-        opt.innerText = p.nombre;
-        select.appendChild(opt);
-      });
-
-      // Resetear la selección al valor por defecto
-      select.value = "";
-    }
-  } catch (e) {
-    console.log('Error al obtener lista de personalidades:', e);
-  }
-}
-
-function cargarPersonalidadSeleccionada() {
-  const select = document.getElementById('selectPersonalidades');
-  const idx = select.value;
-
-  if (idx !== "" && listaPersonalidadesGuardadas[idx]) {
-    document.getElementById('sysPrompt').value = listaPersonalidadesGuardadas[idx].prompt;
-  }
-}
+        window.toggleSidebarMobile = toggleSidebarMobile;
+        window.nuevaConversacion = nuevaConversacion;
+        window.cambiarColorTema = cambiarColorTema;
+        window.cambiarTamanoPersonaje = cambiarTamanoPersonaje;
+        window.exportarChatJSON = exportarChatJSON;
+        window.importarChatJSON = importarChatJSON;
+        window.borrarChatActual = borrarChatActual;
+        window.guardarPersonalidad = guardarPersonalidad;
+        window.cargarPersonalidadSeleccionada = cargarPersonalidadSeleccionada;
+        window.apagarSistema = apagarSistema;
+        window.enviarMensaje = enviarMensaje;
+        window.togglePersonaje = togglePersonaje;
+        window.editarMensaje = editarMensaje;
+        window.borrarMensaje = borrarMensaje;
 
         inicializar();
       </script>
@@ -752,6 +778,6 @@ function cargarPersonalidadSeleccionada() {
   `);
 });
 
-server.listen(3000, () => {
-  console.log("⚡ Servidor con Búsqueda Web Activa en: http://localhost:3000");
+server.listen(3000, "0.0.0.0", () => {
+  console.log("Servidor listo, espera un poco y podrás empezar");
 });
