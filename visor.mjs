@@ -269,7 +269,13 @@ const server = http.createServer(async (req, res) => {
       <title>Asistente Local con Memoria y Web</title>
       <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
       <link rel="stylesheet" href="/styles.css">
+      
+      <!-- Marked.js para renderizar Markdown -->
       <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+      
+      <!-- Highlight.js para dar color a los bloques de código -->
+      <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
     </head>
     <body>
 
@@ -372,12 +378,66 @@ const server = http.createServer(async (req, res) => {
         let chatActualId = localStorage.getItem('volt_current_chat') || null;
         let listaPersonalidadesGuardadas = [];
 
-        let colorGuardado = localStorage.getItem('volt_accent_color') || '#1a1a1a';
+        let colorGuardado = localStorage.getItem('volt_accent_color') || '#7c3aed';
         let tamanoGuardado = localStorage.getItem('volt_avatar_size') || '140';
 
         const cantidadVariantes = {
           pensando: 2, feliz: 3, entusiasmo: 2, triste: 2, normal: 1, sorprendido: 1, confundido: 1, serio: 1
         };
+
+        // Configuración limpia de marked y highlight.js
+        marked.setOptions({
+          highlight: function(code, lang) {
+            const language = hljs.getLanguage(lang) ? lang : 'plaintext';
+            return hljs.highlight(code, { language }).value;
+          }
+        });
+
+        // Función inteligente que transforma los <pre><code> planos en cajas profesionales con cabecera, lenguaje y botón de copiar
+        function formatearBloquesCodigo(htmlInput) {
+          const tempDiv = document.createElement('div');
+          tempDiv.innerHTML = htmlInput;
+
+          tempDiv.querySelectorAll('pre').forEach(pre => {
+            const codeEl = pre.querySelector('code');
+            if (codeEl) {
+              const textoPuro = codeEl.innerText;
+              
+              // Detectar clase de lenguaje (ej: language-javascript -> javascript)
+              let langName = 'código';
+              for (const cls of codeEl.classList) {
+                if (cls.startsWith('language-')) {
+                  langName = cls.replace('language-', '');
+                }
+              }
+
+              const wrapper = document.createElement('div');
+              wrapper.className = 'code-block-wrapper';
+
+              const header = document.createElement('div');
+              header.className = 'code-header';
+              header.innerHTML = \`<span class="lang-name">\${langName}</span>\`;
+
+              const btn = document.createElement('button');
+              btn.className = 'btn-copy-code';
+              btn.innerHTML = '<i class="fa-solid fa-copy"></i> Copiar';
+              btn.onclick = () => {
+                navigator.clipboard.writeText(textoPuro).then(() => {
+                  btn.innerHTML = '<i class="fa-solid fa-check"></i> ¡Copiado!';
+                  setTimeout(() => btn.innerHTML = '<i class="fa-solid fa-copy"></i> Copiar', 2000);
+                });
+              };
+
+              header.appendChild(btn);
+              wrapper.appendChild(header);
+              
+              pre.parentNode.insertBefore(wrapper, pre);
+              wrapper.appendChild(pre);
+            }
+          });
+
+          return tempDiv.innerHTML;
+        }
 
         function toggleSidebarMobile() {
           const sidebar = document.querySelector('.sidebar');
@@ -414,6 +474,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         async function inicializar() {
+          if (colorGuardado === '#1a1a1a') colorGuardado = '#7c3aed';
           cambiarColorTema(colorGuardado);
           document.getElementById('accentColorPicker').value = colorGuardado;
 
@@ -517,7 +578,7 @@ const server = http.createServer(async (req, res) => {
 
           chatArea.innerHTML = '';
           mensajes.forEach((m, index) => {
-            let contenido = m.rol === 'bot' ? marked.parse(m.texto) : m.texto;
+            let contenido = m.rol === 'bot' ? formatearBloquesCodigo(marked.parse(m.texto)) : m.texto;
             let infoHTML = '';
             if (m.recuerdo) infoHTML += \`<span class="info-tag memory-info"><i class="fa-solid fa-brain"></i> Memoria consultada: "\${m.recuerdo}"</span>\`;
             if (m.nuevoRecuerdo) infoHTML += \`<span class="info-tag memory-save"><i class="fa-solid fa-floppy-disk"></i> Nuevo recuerdo guardado: "\${m.nuevoRecuerdo}"</span>\`;
@@ -529,6 +590,12 @@ const server = http.createServer(async (req, res) => {
                 <div class="msg-actions">
                   <i class="fa-solid fa-pen" title="Editar mensaje" onclick="editarMensaje(\${index})"></i>
                   <i class="fa-solid fa-trash" title="Borrar mensaje" onclick="borrarMensaje(\${index})"></i>
+                </div>
+              \`;
+            } else if (m.rol === 'bot') {
+              botonesAccion = \`
+                <div class="msg-actions">
+                  <i class="fa-solid fa-rotate-right" title="Regenerar respuesta" onclick="regenerarRespuesta(\${index})"></i>
                 </div>
               \`;
             }
@@ -556,6 +623,49 @@ const server = http.createServer(async (req, res) => {
           }
         }
 
+        async function regenerarRespuesta(botIndex) {
+          const mensajes = conversaciones[chatActualId].mensajes;
+          if (botIndex > 0 && mensajes[botIndex - 1].rol === 'user') {
+            const preguntaUsuario = mensajes[botIndex - 1].texto;
+            const historialPrevio = mensajes.slice(0, botIndex - 1);
+            
+            mensajes.splice(botIndex, 1);
+            guardarEnLocalStorage();
+            cargarChatArea();
+
+            const sysPrompt = document.getElementById('sysPrompt').value;
+            const tempId = 'temp-' + Date.now();
+            const chatArea = document.getElementById('chatArea');
+            chatArea.innerHTML += \`<div class="message-row bot" id="\${tempId}"><div class="bubble"><i class="fa-solid fa-spinner fa-spin"></i> Regenerando respuesta...</div></div>\`;
+            chatArea.scrollTop = chatArea.scrollHeight;
+
+            cambiarEmocion('pensando');
+            try {
+              const res = await fetch('/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ mensaje: preguntaUsuario, historial: historialPrevio, systemPrompt: sysPrompt })
+              });
+              const data = await res.json();
+              document.getElementById(tempId)?.remove();
+
+              mensajes.push({
+                rol: 'bot',
+                texto: data.respuesta,
+                recuerdo: data.recuerdoUsado,
+                nuevoRecuerdo: data.nuevoRecuerdoGuardado,
+                web: data.webUsada
+              });
+              guardarEnLocalStorage();
+              cargarChatArea();
+              cambiarEmocion(data.emocion || 'normal');
+            } catch(e) {
+              document.getElementById(tempId)?.remove();
+              cambiarEmocion('triste');
+            }
+          }
+        }
+
         async function editarMensaje(index) {
           const mensajes = conversaciones[chatActualId].mensajes;
           const textoOriginal = mensajes[index].texto;
@@ -578,11 +688,12 @@ const server = http.createServer(async (req, res) => {
           try {
             const res = await fetch('/api/chat', {
               method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ mensaje: nuevoTexto.trim(), historial: mensajes.slice(0, index), systemPrompt: sysPrompt })
             });
             const data = await res.json();
             document.getElementById(tempId)?.remove();
-            mensajes.splice(index + 1, 0, {
+            mensajes.push({
               rol: 'bot', texto: data.respuesta, recuerdo: data.recuerdoUsado, nuevoRecuerdo: data.nuevoRecuerdoGuardado, web: data.webUsada
             });
             guardarEnLocalStorage();
@@ -646,6 +757,7 @@ const server = http.createServer(async (req, res) => {
           try {
             const res = await fetch('/api/chat', {
               method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ mensaje: txt, historial: historialPrevio, systemPrompt: sysPrompt })
             });
             const data = await res.json();
@@ -661,7 +773,10 @@ const server = http.createServer(async (req, res) => {
             if (data.nuevoRecuerdoGuardado) infoHTML += \`<span class="info-tag memory-save"><i class="fa-solid fa-floppy-disk"></i> Nuevo recuerdo guardado: "\${data.nuevoRecuerdoGuardado}"</span>\`;
             if (data.webUsada) infoHTML += \`<span class="info-tag web-info"><i class="fa-solid fa-globe"></i> Información obtenida de la Web en tiempo real</span>\`;
 
-            chatArea.innerHTML += \`<div class="message-row bot"><div class="bubble">\${marked.parse(data.respuesta)}\${infoHTML}</div></div>\`;
+            let idxBot = conversaciones[chatActualId].mensajes.length - 1;
+            let botonesBot = \`<div class="msg-actions"><i class="fa-solid fa-rotate-right" title="Regenerar respuesta" onclick="regenerarRespuesta(\${idxBot})"></i></div>\`;
+
+            chatArea.innerHTML += \`<div class="message-row bot"><div class="bubble">\${formatearBloquesCodigo(marked.parse(data.respuesta))}\${infoHTML}\${botonesBot}</div></div>\`;
             cambiarEmocion(data.emocion || 'normal');
           } catch(e) {
             document.getElementById(tempId)?.remove();
@@ -770,6 +885,7 @@ const server = http.createServer(async (req, res) => {
         window.togglePersonaje = togglePersonaje;
         window.editarMensaje = editarMensaje;
         window.borrarMensaje = borrarMensaje;
+        window.regenerarRespuesta = regenerarRespuesta;
 
         inicializar();
       </script>

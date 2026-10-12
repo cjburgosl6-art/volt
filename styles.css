@@ -516,3 +516,53 @@ textarea {
     bottom: 85px;
   }
 }
+
+.code-block-wrapper {
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  margin: 12px 0;
+  overflow: hidden;
+}
+
+.code-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #161b22;
+  padding: 6px 12px;
+  font-size: 0.8rem;
+  color: #8b949e;
+  border-bottom: 1px solid #30363d;
+}
+
+.code-header .lang-name {
+  text-transform: uppercase;
+  font-weight: bold;
+  letter-spacing: 0.5px;
+}
+
+.btn-copy-code {
+  background: transparent;
+  border: none;
+  color: #c9d1d9;
+  font-size: 0.75rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  transition: background 0.2s;
+}
+
+.btn-copy-code:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.code-block-wrapper pre {
+  margin: 0;
+  padding: 12px;
+  background: transparent !important;
+  overflow-x: auto;
+}
