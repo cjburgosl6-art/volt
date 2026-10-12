@@ -1,6 +1,7 @@
 import http from "http";
 import fs from "fs";
 import path from "path";
+import { execSync } from "child_process";
 import Database from "better-sqlite3";
 import { ChromaClient } from "chromadb";
 
@@ -139,7 +140,13 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/api/apagar") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, mensaje: "Apagando..." }));
-    setTimeout(() => process.exit(0), 500);
+    setTimeout(() => {
+      try {
+        // Cierra los procesos abiertos de python (Chroma), ollama y node
+        execSync('taskkill /f /im python.exe /im ollama.exe /im node.exe');
+      } catch (e) {}
+      process.exit(0);
+    }, 500);
     return;
   }
 
